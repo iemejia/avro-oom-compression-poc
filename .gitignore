@@ -2,8 +2,10 @@
 target/
 dependency-reduced-pom.xml
 
-# Generated PoC file
+# Generated PoC files
 poc.avro
+crafted-bomb.avro
+crafted-bomb-2g.avro
 
 # IDE files
 .classpath

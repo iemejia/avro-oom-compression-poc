@@ -7,21 +7,17 @@ import org.apache.avro.generic.GenericRecord;
 import java.io.File;
 
 /**
- * Attempts to read the malicious Avro file created by CreatePoC.
+ * Attempts to read an Avro file and iterate through all records.
  *
- * When run with a constrained heap (e.g. -Xmx32m), this triggers
- * OutOfMemoryError inside DeflateCodec.decompress() because the
- * codec decompresses into an unbounded ByteArrayOutputStream.
+ * When pointed at a decompression-bomb file (created by CreatePoC or
+ * CraftBomb) and run with a constrained heap (e.g. -Xmx32m), this triggers
+ * OutOfMemoryError inside DeflateCodec.decompress() because the codec
+ * decompresses into an unbounded ByteArrayOutputStream.
  *
- * Expected stack trace:
- *   java.lang.OutOfMemoryError: Java heap space
- *     at java.util.Arrays.copyOf(...)
- *     at java.io.ByteArrayOutputStream.ensureCapacity(...)
- *     at java.io.ByteArrayOutputStream.write(...)
- *     at java.util.zip.InflaterOutputStream.write(...)
- *     at org.apache.avro.file.DeflateCodec.decompress(DeflateCodec.java:83)
- *     at org.apache.avro.file.DataFileStream$DataBlock.decompressUsing(...)
- *     at org.apache.avro.file.DataFileStream.hasNext(...)
+ * Exit codes:
+ *   0  -- all records read without error (heap was large enough)
+ *   1  -- unexpected error
+ *   99 -- OutOfMemoryError confirmed (vulnerability reproduced)
  */
 public class TriggerOOM {
 
@@ -37,28 +33,35 @@ public class TriggerOOM {
         File f = new File(inputFile);
         if (!f.exists()) {
             System.err.println("ERROR: File not found: " + inputFile);
-            System.err.println("Run CreatePoC first to generate the malicious Avro file.");
+            System.err.println("Run CreatePoC or CraftBomb first to generate a malicious Avro file.");
             System.exit(1);
         }
 
         System.out.println("File size on disk: " + f.length() + " bytes (" + (f.length() / 1024) + " KB)");
         System.out.println();
-        System.out.println("Attempting to read and decompress...");
-        System.out.println("(This should trigger OutOfMemoryError in DeflateCodec.decompress())");
-        System.out.println();
 
         try (DataFileReader<GenericRecord> reader =
                 new DataFileReader<>(f, new GenericDatumReader<>())) {
+
+            // Show schema so the user can see it looks realistic
+            System.out.println("Schema: " + reader.getSchema().getFullName());
+            System.out.println("Codec:  " + reader.getMetaString("avro.codec"));
+            System.out.println();
+            System.out.println("Reading records...");
+            System.out.println();
 
             int count = 0;
             while (reader.hasNext()) {
                 GenericRecord record = reader.next();
                 count++;
-                System.out.println("Read record #" + count + " (this should not appear with -Xmx32m)");
+
+                // Print a short summary of each record (truncate large fields)
+                String summary = summarize(record, count);
+                System.out.println(summary);
             }
 
             System.out.println();
-            System.out.println("WARNING: All records read successfully without OOM.");
+            System.out.println("WARNING: All " + count + " records read successfully without OOM.");
             System.out.println("This means the heap was large enough. Try with -Xmx32m.");
 
         } catch (OutOfMemoryError e) {
@@ -84,5 +87,35 @@ public class TriggerOOM {
             e.printStackTrace(System.err);
             System.exit(1);
         }
+    }
+
+    /**
+     * Produce a one-line summary of a record, truncating any field longer
+     * than 60 chars.  This lets the user see the innocent preamble records
+     * being read successfully before the bomb block triggers OOM.
+     */
+    private static String summarize(GenericRecord record, int index) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("  #").append(index).append(" {");
+        boolean first = true;
+        for (org.apache.avro.Schema.Field field : record.getSchema().getFields()) {
+            if (!first) sb.append(", ");
+            first = false;
+            String name = field.name();
+            Object val = record.get(name);
+            String str;
+            if (val instanceof java.nio.ByteBuffer) {
+                int len = ((java.nio.ByteBuffer) val).remaining();
+                str = "<" + len + " bytes>";
+            } else {
+                str = String.valueOf(val);
+            }
+            if (str.length() > 60) {
+                str = str.substring(0, 57) + "...";
+            }
+            sb.append(name).append("=").append(str);
+        }
+        sb.append("}");
+        return sb.toString();
     }
 }
