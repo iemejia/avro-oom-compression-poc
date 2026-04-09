@@ -6,6 +6,7 @@ dependency-reduced-pom.xml
 poc.avro
 crafted-bomb.avro
 crafted-bomb-2g.avro
+bomb-*.avro
 
 # IDE files
 .classpath

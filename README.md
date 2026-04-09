@@ -17,16 +17,18 @@ root cause is that every compression codec in Avro decompresses into an
 1. [Vulnerability summary](#vulnerability-summary)
 2. [Affected versions and components](#affected-versions-and-components)
 3. [Technical root cause](#technical-root-cause)
-4. [The crafted `.avro` file](#the-crafted-avro-file)
-5. [How the PoC works](#how-the-poc-works)
-6. [Quick start -- Docker](#quick-start----docker)
-7. [Quick start -- local Maven](#quick-start----local-maven)
-8. [Expected output](#expected-output)
-9. [Project structure](#project-structure)
-10. [Prerequisites](#prerequisites)
-11. [Impact assessment](#impact-assessment)
-12. [Suggested mitigation](#suggested-mitigation)
-13. [References](#references)
+4. [Multi-codec proof](#multi-codec-proof)
+5. [The crafted `.avro` file](#the-crafted-avro-file)
+6. [How the PoC works](#how-the-poc-works)
+7. [Quick start -- Docker](#quick-start----docker)
+8. [Quick start -- local Maven](#quick-start----local-maven)
+9. [Expected output](#expected-output)
+10. [PR #3625 analysis](#pr-3625-analysis)
+11. [Project structure](#project-structure)
+12. [Prerequisites](#prerequisites)
+13. [Impact assessment](#impact-assessment)
+14. [Suggested mitigation](#suggested-mitigation)
+15. [References](#references)
 
 ---
 
@@ -102,6 +104,54 @@ try (InputStream ios = ZstandardLoader.input(bytesIn, useBufferPool)) {
     ios.transferTo(baos);   // unbounded
 }
 ```
+
+---
+
+## Multi-codec proof
+
+The PoC now supports all five Avro compression codecs. Each was tested with
+a 50 MB decompression bomb (repeating `0xDEADBEEF` pattern) and confirmed
+vulnerable:
+
+| Codec | File on disk | Decompressed | Ratio | OOM crash point | Trigger heap |
+| ----- | ----------- | ------------ | ----- | --------------- | ------------ |
+| **Deflate** | 54 KB | 50 MB | 946:1 | `DeflateCodec.decompress:83` | `-Xmx32m` |
+| **BZip2** | 8 KB | 50 MB | 5,913:1 | `BZip2Codec.decompress:69` | `-Xmx32m` |
+| **Zstandard** | 6 KB | 50 MB | 8,220:1 | `ZstandardCodec.decompress:85` | `-Xmx32m` |
+| **XZ** | 9 KB | 50 MB | 5,628:1 | `XZCodec.decompress:75` | `-Xmx32m` |
+| **Snappy** | 2.4 MB | 50 MB | 21:1 | `SnappyCodec.decompress:69` | `-Xmx48m` |
+
+Snappy achieves a lower compression ratio because it prioritizes speed over
+compression density, but the vulnerability mechanism is identical: unbounded
+decompression with no size limit.
+
+### Generating bombs with different codecs
+
+```bash
+# Deflate (default)
+java -Xmx256m -cp <jar> poc.CraftBomb bomb-deflate.avro 50 deflate
+
+# BZip2 -- best ratio, smallest file on disk
+java -Xmx256m -cp <jar> poc.CraftBomb bomb-bzip2.avro 50 bzip2
+
+# Zstandard -- best ratio overall
+java -Xmx256m -cp <jar> poc.CraftBomb bomb-zstandard.avro 50 zstandard
+
+# XZ
+java -Xmx256m -cp <jar> poc.CraftBomb bomb-xz.avro 50 xz
+
+# Snappy -- lower ratio but still exploitable
+java -Xmx256m -cp <jar> poc.CraftBomb bomb-snappy.avro 50 snappy
+```
+
+### Testing all codecs at once
+
+```bash
+./run-all-codecs.sh
+```
+
+This script generates a bomb for each codec, attempts to read it with a
+constrained heap, and reports a summary of which codecs triggered OOM.
 
 ---
 
@@ -317,18 +367,60 @@ Exit code: **99** (vulnerability confirmed).
 
 ---
 
+## PR #3625 analysis
+
+[PR #3625](https://github.com/apache/avro/pull/3625) proposes a fix for this
+vulnerability, but **only patches `DeflateCodec.java`**. The four other
+vulnerable codecs are not addressed.
+
+### What the PR does
+
+The PR modifies `DeflateCodec.decompress()` to:
+
+1. Use `Inflater.inflate()` in a chunked loop instead of
+   `InflaterOutputStream.write()`.
+2. Track total decompressed bytes.
+3. Throw `AvroRuntimeException` if total exceeds a configurable limit
+   (`org.apache.avro.limits.decompress.maxLength`, default 200 MB).
+
+### What the PR does NOT do
+
+| Codec | Patched by PR #3625? | Vulnerable code path |
+| ----- | -------------------- | -------------------- |
+| Deflate | **Yes** | `InflaterOutputStream` -> bounded loop |
+| BZip2 | **No** | `read()` loop into unbounded `NonCopyingByteArrayOutputStream` |
+| Zstandard | **No** | `ios.transferTo(baos)` -- completely unbounded |
+| Snappy | **No** | `ByteBuffer.allocate(uncompressedSize)` -- size from file, no limit |
+| XZ | **No** | `IOUtils.copy()` into unbounded `ByteArrayOutputStream` |
+
+The PR author acknowledged this gap: *"Other codecs have the same issue. We
+can discuss the fix for those in follow-up."*
+
+### Implication
+
+Even after PR #3625 is merged, an attacker can simply use a different codec
+(BZip2 achieves 5,913:1, Zstandard achieves 8,220:1) to bypass the fix
+entirely. The most dangerous codecs from an attacker's perspective
+(Zstandard, BZip2, XZ) remain **fully exploitable**.
+
+This PoC proves this by generating and crashing bomb files for all five
+codecs -- see [Multi-codec proof](#multi-codec-proof).
+
+---
+
 ## Project structure
 
 ```
 avro-oom-compression-poc/
 |-- Dockerfile                          # Multi-stage Docker build + run
 |-- pom.xml                             # Maven project (Avro 1.12.0, shaded jar)
-|-- run-poc.sh                          # Local build-and-run helper script
+|-- run-poc.sh                          # Local build-and-run helper (Deflate only)
+|-- run-all-codecs.sh                   # Multi-codec proof script (all 5 codecs)
 |-- src/
 |   `-- main/
 |       `-- java/
 |           `-- poc/
-|               |-- CraftBomb.java      # Generates the realistic 50 KB bomb file
+|               |-- CraftBomb.java      # Generates realistic bomb file (any codec)
 |               |-- CreatePoC.java      # Generates the minimal 49 KB bomb file
 |               `-- TriggerOOM.java     # Reads any .avro file, triggers OOM
 `-- README.md                           # This file
@@ -338,11 +430,12 @@ avro-oom-compression-poc/
 
 | File | Purpose |
 | ---- | ------- |
-| `pom.xml` | Maven build with `maven-shade-plugin` to produce a single uber-jar containing Avro 1.12.0 and all transitive dependencies (Jackson, Commons Compress, etc.). Targets Java 11. |
-| `CraftBomb.java` | Generates a realistic audit-event `.avro` file with 8 innocent preamble records and a 9th record carrying a 50 MB `0xDEADBEEF` bomb in the `attachment` field. Preamble and bomb are in separate Avro sync blocks. |
+| `pom.xml` | Maven build with `maven-shade-plugin` to produce a single uber-jar containing Avro 1.12.0 and all codec dependencies (Zstandard, Snappy, XZ, Commons Compress). Targets Java 11. |
+| `CraftBomb.java` | Generates a realistic audit-event `.avro` file with 8 innocent preamble records and bomb records carrying repeating `0xDEADBEEF` in the `attachment` field. Supports all codecs via CLI argument: `java poc.CraftBomb [output] [size-MB] [codec]`. |
 | `CreatePoC.java` | Minimal variant: writes one record with 50 MB of zeros in a single `bytes` field. Simpler but obviously synthetic. |
 | `TriggerOOM.java` | Opens any `.avro` file with `DataFileReader`, prints schema/codec metadata and a one-line summary per record, then crashes with OOM on the bomb block. Exits with code 99 on success. |
-| `run-poc.sh` | Shell script that builds (if needed), generates `crafted-bomb.avro`, and runs the trigger with `-Xmx32m`. Interprets exit codes. |
+| `run-poc.sh` | Shell script that builds (if needed), generates a Deflate bomb, and runs the trigger with `-Xmx32m`. |
+| `run-all-codecs.sh` | Shell script that tests all 5 codecs (Deflate, BZip2, Zstandard, Snappy, XZ), generating and triggering a bomb for each. Reports a summary showing all codecs are vulnerable. |
 | `Dockerfile` | Two-stage build: stage 1 compiles with Maven, stage 2 copies the jar into an Alpine JRE image and runs both steps via an embedded entrypoint script. |
 
 ---
@@ -394,17 +487,19 @@ avro-oom-compression-poc/
 ## Suggested mitigation
 
 The fix proposed in [PR #3625](https://github.com/apache/avro/pull/3625)
-adds a configurable maximum decompression size. The approach is:
+adds a configurable maximum decompression size **but only for Deflate**.
+See [PR #3625 analysis](#pr-3625-analysis) for details on the coverage gap.
+
+A complete fix would need to:
 
 1. Add a system property `org.apache.avro.limits.decompress.maxLength`
-   (default: 200 MB).
-2. In `DeflateCodec.decompress()`, decompress in chunks using
-   `Inflater.inflate()` directly, tracking total bytes written.
-3. If the total exceeds the limit, throw `AvroRuntimeException` instead of
-   letting the JVM run out of memory.
-4. Apply the same pattern to all other codecs.
+   (default: 200 MB) -- already done in PR #3625.
+2. Apply size-bounded decompression to **all five codecs**: Deflate, BZip2,
+   Zstandard, Snappy, and XZ -- only Deflate is currently patched.
+3. In each codec's `decompress()`, track total bytes written and throw
+   `AvroRuntimeException` if the limit is exceeded.
 
-Until a fix is released, possible workarounds include:
+Until a complete fix is released, possible workarounds include:
 
 - **Restrict file sources**: Only read Avro files from trusted origins.
 - **Set aggressive `-Xmx`**: This limits damage but still crashes the reader
